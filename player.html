@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Link Player</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 820px; margin: 24px auto; padding: 0 16px; }
+    form { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+    input[type="url"] { flex: 1 1 500px; padding: 8px; border: 1px solid #ddd; border-radius: 8px; }
+    button { padding: 8px 14px; border: 1px solid #ddd; border-radius: 8px; background: #f7f7f7; cursor: pointer; }
+    video { width: 100%; max-height: 70vh; background: #000; border-radius: 12px; }
+    label { display: inline-flex; align-items: center; gap: 6px; }
+  </style>
+</head>
+<body>
+  <h1>Play a direct video link</h1>
+  <form id="f">
+    <input id="src" type="url" placeholder="https://example.com/video.mp4 or .m3u8" required />
+    <button type="submit">Play</button>
+    <label><input type="checkbox" id="muted" checked> Muted</label>
+    <label><input type="checkbox" id="autoplay"> Autoplay</label>
+  </form>
+
+  <video id="v" controls playsinline></video>
+
+  <!-- HLS support (for .m3u8) -->
+  <script src="https://unpkg.com/hls.js@latest"></script>
+  <script>
+    const v = document.getElementById('v');
+    const field = document.getElementById('src');
+    const params = new URLSearchParams(location.search);
+
+    if (params.get('src')) field.value = params.get('src');
+    if (params.get('autoplay') === '1') document.getElementById('autoplay').checked = true;
+
+    function play(url) {
+      const autoplay = document.getElementById('autoplay').checked;
+      const muted = document.getElementById('muted').checked;
+      v.muted = muted;
+
+      if (url.endsWith('.m3u8')) {
+        if (Hls.isSupported()) {
+          const hls = new Hls();
+          hls.loadSource(url);
+          hls.attachMedia(v);
+          if (autoplay) v.play().catch(() => {});
+        } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
+          v.src = url;
+          if (autoplay) v.play().catch(() => {});
+        } else {
+          alert('HLS (.m3u8) not supported in this browser.');
+        }
+      } else {
+        v.src = url; // mp4/webm/ogg, etc.
+        if (autoplay) v.play().catch(() => {});
+      }
+    }
+
+    document.getElementById('f').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const url = field.value.trim();
+      if (!url) return;
+      const qs = new URLSearchParams();
+      qs.set('src', url);
+      if (document.getElementById('autoplay').checked) qs.set('autoplay','1');
+      history.replaceState(null, '', location.pathname + '?' + qs.toString());
+      play(url);
+    });
+
+    if (field.value) play(field.value);
+  </script>
+</body>
+</html>
