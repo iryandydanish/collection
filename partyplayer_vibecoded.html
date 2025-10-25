@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Watch Party (YouTube + MP4/HLS)</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; max-width: 900px; margin: 24px auto; padding: 0 16px; line-height: 1.45; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+  input[type="url"],input[type="text"]{ flex:1 1 420px; padding:10px 12px; border:1px solid #ddd; border-radius:10px; }
+  button{ padding:10px 14px; border:1px solid #ddd; border-radius:10px; background:#f6f6f6; cursor:pointer; }
+  label{ display:inline-flex; align-items:center; gap:6px; user-select:none; }
+  .player{ position:relative; aspect-ratio:16/9; background:#000; border-radius:12px; overflow:hidden; }
+  video,iframe{ width:100%; height:100%; display:block; border:0; }
+  #ytWrap{ display:none; }
+  #html5{ display:none; }
+  .chip{ display:inline-block; padding:4px 8px; border:1px solid #ddd; border-radius:999px; font-size:12px; }
+</style>
+</head>
+<body>
+  <h1>Watch Party</h1>
+
+  <div class="row">
+    <input id="room" type="text" placeholder="Room name (e.g. myfriends)" />
+    <input id="src" type="url" placeholder="Paste a YouTube / MP4 / .m3u8 URL…" />
+    <button id="go">Create / Join</button>
+    <label><input type="checkbox" id="muted" checked> Muted</label>
+    <label><input type="checkbox" id="autoplay"> Autoplay</label>
+    <span id="status" class="chip">disconnected</span>
+  </div>
+
+  <div class="player">
+    <!-- HTML5 player -->
+    <video id="v" controls playsinline></video>
+    <!-- YouTube iframe -->
+    <div id="ytWrap"><div id="yt"></div></div>
+  </div>
+
+  <!-- libs -->
+  <script src="https://cdn.ably.com/lib/ably.min-1.js"></script>
+  <script src="https://unpkg.com/hls.js@latest"></script>
+  <script src="https://www.youtube.com/iframe_api"></script>
+
+  <script>
+    // ====== CONFIG ======
+    const ABLY_KEY = "eyYIIA.WZefeQ:CLkYYfh7FTvsSb5zlXaQagSJNxHakxRFqY0bcRm1caM"; // ← paste your Ably key
+    // ====================
+
+    // UI
+    const fieldRoom = document.getElementById('room');
+    const fieldSrc = document.getElementById('src');
+    const statusEl = document.getElementById('status');
+    const goBtn = document.getElementById('go');
+    const checkboxAutoplay = document.getElementById('autoplay');
+    const checkboxMuted = document.getElementById('muted');
+
+    // Players
+    const v = document.getElementById('v');
+    const ytWrap = document.getElementById('ytWrap');
+    let ytPlayer = null;
+    let hls = null;
+
+    // State
+    let channel = null;
+    let suppressLocal = false; // avoid echo loops
+    let usingYouTube = false;
+
+    // Query params bootstrap
+    const params = new URLSearchParams(location.search);
+    if (params.get('room')) fieldRoom.value = params.get('room');
+    if (params.get('src')) fieldSrc.value = params.get('src');
+    if (params.get('autoplay') === '1') checkboxAutoplay.checked = true;
+
+    // Helpers
+    function isYouTube(url) {
+      try {
+        const u = new URL(url);
+        const h = u.hostname.replace(/^www\./,'');
+        return h.endsWith('youtube.com') || h.endsWith('youtu.be');
+      } catch { return false; }
+    }
+    function getYouTubeID(url) {
+      try {
+        const u = new URL(url);
+        const host = u.hostname.replace(/^www\./,'');
+        if (host.endsWith('youtu.be')) return u.pathname.split('/')[1] || null;
+        if (host.endsWith('youtube.com')) {
+          if (u.pathname === '/watch') return u.searchParams.get('v');
+          if (u.pathname.startsWith('/shorts/')) return u.pathname.split('/')[2] || null;
+          if (u.pathname.startsWith('/live/')) return u.pathname.split('/')[2] || null;
+          if (u.pathname.startsWith('/embed/')) return u.pathname.split('/')[2] || null;
+        }
+      } catch {}
+      return null;
+    }
+    function parseYTStartSeconds(url) {
+      try {
+        const u = new URL(url);
+        let t = u.searchParams.get('t') || u.searchParams.get('start') || '';
+        if (!t) return 0;
+        if (/^\d+$/.test(t)) return +t;
+        const m = /(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?/.exec(t);
+        if (!m) return 0;
+        return (+(m[1]||0))*3600 + (+(m[2]||0))*60 + (+(m[3]||0));
+      } catch { return 0; }
+    }
+    function show(which) {
+      if (which === 'yt') {
+        ytWrap.style.display = 'block';
+        v.style.display = 'none';
+      } else {
+        ytWrap.style.display = 'none';
+        v.style.display = 'block';
+      }
+    }
+    function cleanupHTML5() {
+      if (hls) { hls.destroy(); hls = null; }
+      v.pause(); v.removeAttribute('src'); v.load();
+    }
+    function setStatus(text) { statusEl.textContent = text; }
+
+    // YouTube API callback
+    window.onYouTubeIframeAPIReady = () => {};
+
+    function loadPlayer(url) {
+      const autoplay = checkboxAutoplay.checked;
+      const muted = checkboxMuted.checked;
+
+      if (isYouTube(url)) {
+        // YT
+        usingYouTube = true;
+        cleanupHTML5();
+        show('yt');
+
+        const id = getYouTubeID(url);
+        const start = parseYTStartSeconds(url);
+        if (!id) return alert('Could not extract YouTube video ID.');
+
+        if (ytPlayer) ytPlayer.destroy();
+        ytPlayer = new YT.Player('yt', {
+          videoId: id,
+          playerVars: {
+            autoplay: autoplay ? 1 : 0,
+            mute: muted ? 1 : 0,
+            playsinline: 1,
+            rel: 0,
+            start: start
+          },
+          events: {
+            onReady: () => { if (autoplay) ytPlayer.playVideo(); },
+            onStateChange: (e) => {
+              if (suppressLocal || !channel) return;
+              const t = ytPlayer.getCurrentTime ? ytPlayer.getCurrentTime() : 0;
+              const payload = { at: Date.now(), t };
+              if (e.data === YT.PlayerState.PLAYING) channel.publish('play', payload);
+              else if (e.data === YT.PlayerState.PAUSED) channel.publish('pause', payload);
+            }
+          }
+        });
+      } else {
+        // HTML5 / HLS
+        usingYouTube = false;
+        show('html5');
+        v.muted = muted;
+
+        if (url.endsWith('.m3u8')) {
+          if (Hls.isSupported()) {
+            cleanupHTML5();
+            hls = new Hls(); hls.loadSource(url); hls.attachMedia(v);
+            if (autoplay) v.play().catch(()=>{});
+          } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
+            cleanupHTML5();
+            v.src = url; if (autoplay) v.play().catch(()=>{});
+          } else {
+            alert('HLS (.m3u8) not supported in this browser.');
+          }
+        } else {
+          cleanupHTML5();
+          v.src = url; if (autoplay) v.play().catch(()=>{});
+        }
+      }
+    }
+
+    // Local → remote broadcasts (HTML5)
+    v.addEventListener('play', () => {
+      if (suppressLocal || !channel || usingYouTube) return;
+      channel.publish('play', { at: Date.now(), t: v.currentTime });
+    });
+    v.addEventListener('pause', () => {
+      if (suppressLocal || !channel || usingYouTube) return;
+      channel.publish('pause', { at: Date.now(), t: v.currentTime });
+    });
+    v.addEventListener('seeked', () => {
+      if (suppressLocal || !channel || usingYouTube) return;
+      channel.publish('seek', { at: Date.now(), t: v.currentTime });
+    });
+
+    // Connect to Ably + subscribe
+    async function connect(room) {
+      setStatus('connecting…');
+      const ably = new Ably.Realtime.Promise({ key: ABLY_KEY, echoMessages: false });
+      await ably.connection.once('connected');
+      setStatus('connected');
+      channel = ably.channels.get(`watchparty:${room}`);
+
+      channel.subscribe('play', ({ data }) => applyRemote('play', data));
+      channel.subscribe('pause', ({ data }) => applyRemote('pause', data));
+      channel.subscribe('seek', ({ data }) => applyRemote('seek', data));
+      channel.subscribe('sync_req', () => sendSync());
+      channel.subscribe('sync', ({ data }) => applySync(data));
+
+      // Ask others to sync me
+      channel.publish('sync_req', { who: Math.random().toString(36).slice(2) });
+    }
+
+    function nowSec() { return Date.now() / 1000; }
+
+    function applyRemote(kind, data) {
+      // latency-adjusted target time
+      const remoteT = (data && typeof data.t === 'number') ? data.t : 0;
+      const atMs = (data && typeof data.at === 'number') ? data.at : Date.now();
+      const target = remoteT + (Date.now() - atMs) / 1000;
+
+      suppressLocal = true;
+      if (usingYouTube && ytPlayer) {
+        if (Math.abs(ytPlayer.getCurrentTime() - target) > 0.4) ytPlayer.seekTo(target, true);
+        if (kind === 'play') ytPlayer.playVideo();
+        if (kind === 'pause') ytPlayer.pauseVideo();
+      } else {
+        if (Math.abs(v.currentTime - target) > 0.4) v.currentTime = target;
+        if (kind === 'play') v.play().catch(()=>{});
+        if (kind === 'pause') v.pause();
+        if (kind === 'seek') { /* nothing else */ }
+      }
+      setTimeout(() => (suppressLocal = false), 250);
+    }
+
+    function sendSync() {
+      if (!channel) return;
+      let t=0, paused=true;
+      if (usingYouTube && ytPlayer) {
+        t = ytPlayer.getCurrentTime ? ytPlayer.getCurrentTime() : 0;
+        const s = ytPlayer.getPlayerState ? ytPlayer.getPlayerState() : YT.PlayerState.PAUSED;
+        paused = (s !== YT.PlayerState.PLAYING);
+      } else {
+        t = v.currentTime || 0;
+        paused = v.paused;
+      }
+      channel.publish('sync', { at: Date.now(), t, paused });
+    }
+
+    function applySync(data) {
+      const target = data.t + (Date.now() - data.at)/1000;
+      suppressLocal = true;
+      if (usingYouTube && ytPlayer) {
+        ytPlayer.seekTo(target, true);
+        if (data.paused) ytPlayer.pauseVideo(); else ytPlayer.playVideo();
+      } else {
+        v.currentTime = target;
+        if (data.paused) v.pause(); else v.play().catch(()=>{});
+      }
+      setTimeout(() => (suppressLocal = false), 250);
+    }
+
+    // Join handler
+    goBtn.addEventListener('click', () => {
+      const room = fieldRoom.value.trim();
+      const url = fieldSrc.value.trim();
+      if (!room || !url) return alert('Enter both a room name and a video URL.');
+      // persist to URL for share
+      const qs = new URLSearchParams();
+      qs.set('room', room);
+      qs.set('src', url);
+      if (checkboxAutoplay.checked) qs.set('autoplay', '1');
+      history.replaceState(null, '', location.pathname + '?' + qs.toString());
+
+      loadPlayer(url);
+      connect(room);
+    });
+
+    // Auto-join if params present
+    if (fieldRoom.value && fieldSrc.value) {
+      loadPlayer(fieldSrc.value);
+      connect(fieldRoom.value);
+    }
+  </script>
+</body>
+</html>
